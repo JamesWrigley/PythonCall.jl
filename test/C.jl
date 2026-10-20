@@ -134,3 +134,95 @@ end
         @test occursin("JULIA_PYTHONCALL_EXE is not set", String(take!(err)))
     end
 end
+
+@testitem "GC while other threads wait for the GIL" begin
+    # A Julia thread blocked on the GIL outside a GC-safe region stops any GC from
+    # completing, and then the process can't even be interrupted, so run these in a
+    # killable subprocess.
+    script = """
+    using PythonCall
+    function on_thread(f, tid)
+        task = Task(f)
+        task.sticky = true
+        @ccall jl_set_task_tid(task::Any, (tid - 1)::Cint)::Cint
+        schedule(task)
+    end
+    busy = pyeval("lambda n: sum(1 for _ in range(n))", Main)
+    waiter_work() = pyconvert(Int, pybuiltins.len(pylist([1, 2])))
+    waiter_work()
+
+    # GC while another thread waits to attach a state
+    holding = Threads.Atomic{Bool}(false)
+    waiting = Threads.Atomic{Bool}(false)
+    holder = on_thread(2) do
+        @pyregion begin
+            holding[] = true
+            while !waiting[]
+            end
+            # Hold the GIL without yielding so the waiter blocks on it
+            Libc.systemsleep(0.5)
+            GC.gc()
+        end
+    end
+    waiter = on_thread(3) do
+        while !holding[]
+            yield()
+        end
+        waiting[] = true
+        waiter_work()
+    end
+    wait(holder)
+    if fetch(waiter) != 2
+        exit(1)
+    end
+
+    # GC while another thread is in plain Python code, which re-takes the GIL
+    # after dropping it at every switch interval
+    started = Threads.Atomic{Bool}(false)
+    looper = on_thread(2) do
+        started[] = true
+        pyconvert(Int, busy(10_000_000))
+    end
+    collector = on_thread(3) do
+        while !started[]
+            yield()
+        end
+        Libc.systemsleep(0.1)
+        @pyregion begin
+            waiter_work()
+            GC.gc()
+        end
+    end
+    wait(collector)
+    if fetch(looper) != 10_000_000
+        exit(2)
+    end
+
+    # GC from Python-to-Julia callbacks while another thread contends for the GIL
+    callback = pyfunc(i -> (GC.gc(false); length(rand(100))))
+    call_all = pyeval("lambda f, n: sum(f(i) for i in range(n))", Main)
+    contender = on_thread(2) do
+        pyconvert(Int, busy(5_000_000))
+    end
+    caller = on_thread(3) do
+        pyconvert(Int, call_all(callback, 200))
+    end
+    wait(contender)
+    if fetch(caller) != 20_000
+        exit(3)
+    end
+    """
+    # Calls into Python stay GC-unsafe on Julia 1.12, see `@gcsafe_ccall`
+    if v"1.12" <= VERSION < v"1.13"
+        @test_skip false
+    else
+        cmd = `$(Base.julia_cmd()) --startup-file=no --threads=3 --project=$(Base.active_project()) -e $script`
+        proc = run(pipeline(cmd; stdout, stderr); wait = false)
+        status = timedwait(() -> process_exited(proc), 10)
+        if status != :ok
+            kill(proc, Base.SIGKILL)
+        end
+        @test status == :ok
+        @test success(proc)
+    end
+end

@@ -306,7 +306,44 @@ end
 PyThreadState_GetUnchecked() =
     ccall(POINTERS.PyThreadState_GetUnchecked, Ptr{Cvoid}, ())
 
+# Call into Python in a GC-safe region, taking an `@ccall`-style call through a
+# function pointer: `$(fptr)(arg::T, ...)::R`. Python can block re-taking the GIL
+# mid-call (at every switch interval, or in a C extension releasing it), and a GC
+# started by a Julia thread holding the GIL would otherwise wait on this thread
+# forever. Callbacks into Julia through `@cfunction` switch back to GC-unsafe.
+macro gcsafe_ccall(ex)
+    if VERSION >= v"1.13"
+        return esc(:(@ccall gc_safe = true $ex))
+    elseif VERSION >= v"1.12"
+        # Julia 1.12 enters a `@cfunction` from a GC-safe region without polling for
+        # a GC in progress (JuliaLang/julia#62636), so callbacks could run alongside
+        # the collector. Stay GC-unsafe, at the risk of the deadlock above.
+        return esc(:(@ccall $ex))
+    end
+    # Before Julia 1.12 make the transition explicitly, converting the arguments
+    # first since no Julia code may run in the GC-safe region.
+    call, rettype = ex.args
+    fptr = call.args[1].args[1]
+    args = call.args[2:end]
+    types = [esc(arg.args[2]) for arg in args]
+    f = gensym("fptr")
+    cs = [gensym("c") for _ in args]
+    ps = [gensym("p") for _ in args]
+    quote
+        local $f = $(esc(fptr))
+        $([:(local $c = Base.cconvert($T, $(esc(arg.args[1])))) for (c, T, arg) in zip(cs, types, args)]...)
+        Base.GC.@preserve $(cs...) begin
+            $([:(local $p = Base.unsafe_convert($T, $c)) for (p, T, c) in zip(ps, types, cs)]...)
+            local gc_state = @ccall jl_gc_safe_enter()::Int8
+            local ans = ccall($f, $(esc(rettype)), ($(types...),), $(ps...))
+            @ccall jl_gc_safe_leave(gc_state::Int8)::Cvoid
+            ans
+        end
+    end
+end
+
 for (name, (argtypes, rettype)) in CAPI_FUNC_SIGS
     args = [Symbol("x", i) for (i, _) in enumerate(argtypes)]
-    @eval $name($(args...)) = ccall(POINTERS.$name, $rettype, ($(argtypes...),), $(args...))
+    call = Expr(:call, Expr(:$, :(POINTERS.$name)), [:($x::$T) for (x, T) in zip(args, argtypes)]...)
+    @eval $name($(args...)) = @gcsafe_ccall $(Expr(:(::), call, rettype))
 end

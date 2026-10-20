@@ -73,7 +73,7 @@ PyObject_GetBuffer(_o, b, flags) = Base.GC.@preserve _o begin
         PyErr_SetString(POINTERS.PyExc_TypeError, msg)
         return Cint(-1)
     end
-    return ccall(getbuf, Cint, (PyPtr, Ptr{Py_buffer}, Cint), o, b, flags)
+    return @gcsafe_ccall $(getbuf)(o::PyPtr, b::Ptr{Py_buffer}, flags::Cint)::Cint
 end
 
 PyBuffer_Release(_b) = begin
@@ -82,7 +82,7 @@ PyBuffer_Release(_b) = begin
     o == C_NULL && return
     releasebuf = PyType_GetSlot(Py_Type(o), Py_bf_releasebuffer)
     if releasebuf != C_NULL
-        ccall(releasebuf, Cvoid, (PyPtr, Ptr{Py_buffer}), o, b)
+        @gcsafe_ccall $(releasebuf)(o::PyPtr, b::Ptr{Py_buffer})::Cvoid
     end
     b.obj[] = C_NULL
     Py_DecRef(o)
@@ -103,7 +103,7 @@ function PyOS_RunInputHook()
     if hook == C_NULL
         return false
     else
-        ccall(hook, Cint, ())
+        @gcsafe_ccall $(hook)()::Cint
         return true
     end
 end
