@@ -64,6 +64,34 @@ function tstate_attached()
 end
 has_tstate() = CTX.is_initialized && tstate_attached()
 
+# Decrefs queued by finalizers which ran while no state was attached. Since a
+# finalizer must not block attaching one, they're freed whenever a region or
+# break attaches a state, or by `PythonCall.GC.gc()`.
+const DECREF_QUEUE = (; items = PyPtr[], lock = Threads.SpinLock())
+
+# Requires an attached state. Decrefs run outside the lock, since a dealloc may
+# release the GIL to a thread that then waits on the lock.
+function free_decref_queue()
+    ptrs = Base.@lock DECREF_QUEUE.lock begin
+        ptrs = copy(DECREF_QUEUE.items)
+        empty!(DECREF_QUEUE.items)
+        ptrs
+    end
+    for ptr in ptrs
+        if ptr != C_NULL
+            Py_DecRef(ptr)
+        end
+    end
+    return
+end
+
+function drain_decref_queue()
+    if !isempty(DECREF_QUEUE.items)
+        free_decref_queue()
+    end
+    return
+end
+
 # An attached task is pinned to this Julia thread and owns its semaphore, so the
 # thread-local cache cannot change underneath it.  This makes nested regions avoid
 # the considerably more expensive OncePerTask lookup.  The cache is cleared before
@@ -299,6 +327,7 @@ macro pyregion(ex)
             local state = $current_task_state(task)
             local token = $enter_region(task, state)
             try
+                $drain_decref_queue()
                 $(esc(ex))
             finally
                 $exit_region(task, state, token)
@@ -319,10 +348,15 @@ macro pyregionbreak(ex)
         local task = current_task()
         local state = $current_task_state(task)
         local token = $enter_break(task, state)
-        try
+        local ans = try
             $(esc(ex))
         finally
             $exit_break(task, state, token)
         end
+        # Every token but :noop means the state was attached again on exit
+        if token !== :noop
+            $drain_decref_queue()
+        end
+        ans
     end
 end

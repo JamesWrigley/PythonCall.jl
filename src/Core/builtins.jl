@@ -582,7 +582,7 @@ end
 
 pystr_fromUTF8(x::Ptr, n::Integer) =
     @pyregion pynew(errcheck(C.PyUnicode_DecodeUTF8(x, n, C_NULL)))
-pystr_fromUTF8(x) = pystr_fromUTF8(pointer(x), sizeof(x))
+pystr_fromUTF8(x) = Base.GC.@preserve x pystr_fromUTF8(pointer(x), sizeof(x))
 
 """
     pystr(x)
@@ -617,7 +617,7 @@ pyisstr(x) = pytypecheckfast(x, C.Py_TPFLAGS_UNICODE_SUBCLASS)
 
 pybytes_fromdata(x::Ptr, n::Integer) =
     @pyregion pynew(errcheck(C.PyBytes_FromStringAndSize(x, n)))
-pybytes_fromdata(x) = pybytes_fromdata(pointer(x), sizeof(x))
+pybytes_fromdata(x) = Base.GC.@preserve x pybytes_fromdata(pointer(x), sizeof(x))
 
 """
     pybytes(x)
