@@ -21,8 +21,8 @@ if Base.VERSION ≥ v"1.11"
     )
 end
 
-const QUEUE = (; items = C.PyPtr[], lock = Threads.SpinLock())
 const HOOK = Ref{WeakRef}()
+const DRAIN_SCHEDULED = Threads.Atomic{Bool}(false)
 
 """
     PythonCall.GC.disable()
@@ -70,19 +70,7 @@ operation safely establishes the state it needs and can be called from any Julia
 """
 function gc()
     if C.CTX.is_initialized
-        @pyregion unsafe_free_queue()
-    end
-    nothing
-end
-
-function unsafe_free_queue()
-    Base.@lock QUEUE.lock begin
-        for ptr in QUEUE.items
-            if ptr != C.PyNULL
-                C.Py_DecRef(ptr)
-            end
-        end
-        empty!(QUEUE.items)
+        @pyregion C.free_decref_queue()
     end
     nothing
 end
@@ -96,16 +84,15 @@ function enqueue(ptr::C.PyPtr)
             # An attached state lets us immediately free without blocking a finalizer.
             C.Py_DecRef(ptr)
             # We may as well also free any other enqueued objects.
-            if !isempty(QUEUE.items)
-                unsafe_free_queue()
-            end
+            C.drain_decref_queue()
         else
             # Otherwise we push the pointer onto the queue to be freed later, either:
             # (a) If a future Python object is finalized with a state already attached
             #     in the branch above.
-            # (b) If the GCHook() object below is finalized in an ordinary GC.
-            # (c) If the user calls PythonCall.GC.gc().
-            Base.@lock QUEUE.lock push!(QUEUE.items, ptr)
+            # (b) When a region or region break next attaches a state.
+            # (c) From a task the GCHook() object below schedules in an ordinary GC.
+            # (d) If the user calls PythonCall.GC.gc().
+            Base.@lock C.DECREF_QUEUE.lock push!(C.DECREF_QUEUE.items, ptr)
         end
     end
     nothing
@@ -119,11 +106,9 @@ function enqueue_all(ptrs)
                     C.Py_DecRef(ptr)
                 end
             end
-            if !isempty(QUEUE.items)
-                unsafe_free_queue()
-            end
+            C.drain_decref_queue()
         else
-            Base.@lock QUEUE.lock append!(QUEUE.items, ptrs)
+            Base.@lock C.DECREF_QUEUE.lock append!(C.DECREF_QUEUE.items, ptrs)
         end
     end
     nothing
@@ -135,8 +120,9 @@ end
 An immortal object which frees any pending Python objects when Julia's GC runs.
 
 This works by creating it but not holding any strong reference to it, so it is eligible
-to be finalized by Julia's GC. The finalizer empties the PythonCall GC queue if
-possible. The finalizer also re-attaches itself, so the object does not actually get
+to be finalized by Julia's GC. The finalizer empties the PythonCall GC queue, directly if
+a state is attached and otherwise from a task, since a finalizer must not block attaching
+one. The finalizer also re-attaches itself, so the object does not actually get
 collected and so the finalizer will run again at next GC.
 """
 mutable struct GCHook
@@ -148,8 +134,18 @@ end
 function _gchook_finalizer(x)
     if C.CTX.is_initialized
         finalizer(_gchook_finalizer, x)
-        if !isempty(QUEUE.items) && C.has_tstate()
-            unsafe_free_queue()
+        if !isempty(C.DECREF_QUEUE.items)
+            if C.has_tstate()
+                C.free_decref_queue()
+            elseif !Threads.atomic_xchg!(DRAIN_SCHEDULED, true)
+                # Cleared afterwards so drains blocked on the GIL can't pile up;
+                # anything queued meanwhile is freed on the next attach.
+                errormonitor(Threads.@spawn try
+                    gc()
+                finally
+                    DRAIN_SCHEDULED[] = false
+                end)
+            end
         end
     end
     nothing
