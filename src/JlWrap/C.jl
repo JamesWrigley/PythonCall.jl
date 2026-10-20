@@ -38,7 +38,8 @@ const PYJL_LOCK = Threads.SpinLock()
 function _pyjl_new(t::C.PyPtr, ::C.PyPtr, ::C.PyPtr)
     alloc = C.PyType_GetSlot(t, C.Py_tp_alloc)
     alloc == C_NULL && return C.PyNULL
-    o = ccall(alloc, C.PyPtr, (C.PyPtr, C.Py_ssize_t), t, 0)
+    # Allocating can trigger Python's cyclic GC, which runs arbitrary finalizers
+    o = C.@gcsafe_ccall $(alloc)(t::C.PyPtr, 0::C.Py_ssize_t)::C.PyPtr
     o == C.PyNULL && return C.PyNULL
     C.@ft UnsafePtr{PyJuliaValueObject}(o).weaklist[] = C.PyNULL
     C.@ft UnsafePtr{PyJuliaValueObject}(o).value[] = 0
@@ -312,7 +313,7 @@ function _pyjl_serialize(self::C.PyPtr, ::C.PyPtr)
         io = IOBuffer()
         serialize(io, PyJuliaValue_GetValue(self))
         b = take!(io)
-        return C.PyBytes_FromStringAndSize(pointer(b), sizeof(b))
+        return Base.GC.@preserve b C.PyBytes_FromStringAndSize(pointer(b), sizeof(b))
     catch e
         C.PyErr_SetString(C.POINTERS.PyExc_Exception, "error serializing this value")
         # wrap sprint in another try-catch block to prevent this function from throwing
